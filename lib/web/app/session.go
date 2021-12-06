@@ -29,6 +29,7 @@ import (
 	"github.com/gravitational/ttlmap"
 
 	"github.com/gravitational/oxy/forward"
+	oxyutils "github.com/gravitational/oxy/utils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -62,30 +63,34 @@ func (h *Handler) newSession(ctx context.Context, ws types.WebSession) (*session
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	server, err := Match(ctx, accessPoint, MatchPublicAddr(identity.RouteToApp.PublicAddr))
+
+	servers, err := Match(ctx, accessPoint, MatchAll(MatchHealthy(h.c.ProxyClient, identity), MatchPublicAddr(identity.RouteToApp.PublicAddr)))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Create a rewriting transport that will be used to forward requests.
 	transport, err := newTransport(&transportConfig{
+		log:          h.log,
 		proxyClient:  h.c.ProxyClient,
 		accessPoint:  h.c.AccessPoint,
 		cipherSuites: h.c.CipherSuites,
 		identity:     identity,
-		server:       server,
+		servers:      servers,
 		ws:           ws,
 		clusterName:  h.clusterName,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	fwd, err := forward.New(
 		forward.FlushInterval(100*time.Millisecond),
 		forward.RoundTripper(transport),
 		forward.Logger(h.log),
 		forward.PassHostHeader(true),
-		forward.WebsocketDial(transport.dialer),
+		forward.WebsocketDial(transport.DialWebsocket),
+		forward.ErrorHandler(oxyutils.ErrorHandlerFunc(h.handleForwardError)),
 	)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -150,6 +155,14 @@ func (s *sessionCache) set(key string, value *session, ttl time.Duration) error 
 		return trace.Wrap(err)
 	}
 	return nil
+}
+
+// remove immediately removes a single session from the cache.
+func (s *sessionCache) remove(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, _ = s.cache.Remove(key)
 }
 
 // expireSessions ticks every second trying to close expired sessions.

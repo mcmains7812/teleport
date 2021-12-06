@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
@@ -32,6 +33,7 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/oxy/forward"
 	"github.com/gravitational/trace"
@@ -43,13 +45,14 @@ type transportConfig struct {
 	accessPoint  auth.ReadProxyAccessPoint
 	cipherSuites []uint16
 	identity     *tlsca.Identity
-	server       types.AppServer
+	servers      []types.AppServer
 	ws           types.WebSession
 	clusterName  string
+	log          *logrus.Entry
 }
 
 // Check validates configuration.
-func (c transportConfig) Check() error {
+func (c *transportConfig) Check() error {
 	if c.proxyClient == nil {
 		return trace.BadParameter("proxy client missing")
 	}
@@ -62,8 +65,8 @@ func (c transportConfig) Check() error {
 	if c.identity == nil {
 		return trace.BadParameter("identity missing")
 	}
-	if c.server == nil {
-		return trace.BadParameter("server missing")
+	if c.servers == nil {
+		return trace.BadParameter("servers missing")
 	}
 	if c.ws == nil {
 		return trace.BadParameter("web session missing")
@@ -78,13 +81,14 @@ func (c transportConfig) Check() error {
 // transport is a rewriting http.RoundTripper that can forward requests to
 // an application service.
 type transport struct {
-	c *transportConfig
+	mu sync.Mutex
+	c  *transportConfig
 
 	// tr is used for forwarding http connections.
 	tr http.RoundTripper
 
-	// dialer is used for forwarding websocket connections.
-	dialer forward.Dialer
+	// clientTLSConfig *tls.Config that will be used for mutual authentication.
+	clientTLSConfig *tls.Config
 }
 
 // newTransport creates a new transport.
@@ -98,17 +102,20 @@ func newTransport(c *transportConfig) (*transport, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	tr.DialContext = dialFunc(c)
-	tr.TLSClientConfig, err = configureTLS(c)
+
+	t := &transport{
+		c:  c,
+		tr: tr,
+	}
+
+	t.clientTLSConfig, err = configureTLS(c)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return &transport{
-		c:      c,
-		tr:     tr,
-		dialer: websocketsDialer(tr),
-	}, nil
+	tr.DialContext = t.DialContext
+	tr.TLSClientConfig = t.clientTLSConfig
+	return t, nil
 }
 
 // RoundTrip will rewrite the request, forward the request to the target
@@ -159,39 +166,62 @@ func (t *transport) rewriteRequest(r *http.Request) error {
 	return nil
 }
 
-// websocketsDialer returns a function that dials a websocket connection
-// over the transport's reverse tunnel.
-func websocketsDialer(tr *http.Transport) forward.Dialer {
-	return func(network, address string) (net.Conn, error) {
-		conn, err := tr.DialContext(context.Background(), network, address)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// App access connections over reverse tunnel use mutual TLS.
-		return tls.Client(conn, tr.TLSClientConfig), nil
-	}
-}
+// DialContext
+func (t *transport) DialContext(ctx context.Context, _ string, _ string) (net.Conn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-// dialFunc returns a function that can Dial and connect to the application
-// service over the reverse tunnel subsystem.
-func dialFunc(c *transportConfig) func(ctx context.Context, network string, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
-		clusterClient, err := c.proxyClient.GetSite(c.identity.RouteToApp.ClusterName)
+	for i := len(t.c.servers) - 1; i >= 0; i-- {
+		conn, err := dialAppServer(t.c.proxyClient, t.c.identity, t.c.servers[i])
 		if err != nil {
+			// Connection problem with the server.
+			if trace.IsConnectionProblem(err) {
+				t.c.log.Warnf("failed to connect to app server: %v.", err)
+
+				// remove the failed server from the list.
+				t.c.servers = append(t.c.servers[:i], t.c.servers[i+1:]...)
+				continue
+			}
+
 			return nil, trace.Wrap(err)
 		}
 
-		conn, err := clusterClient.Dial(reversetunnel.DialParams{
-			From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@web-proxy"},
-			To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
-			ServerID: fmt.Sprintf("%v.%v", c.server.GetHostID(), c.identity.RouteToApp.ClusterName),
-			ConnType: types.AppTunnel,
-		})
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
 		return conn, nil
 	}
+
+	return nil, trace.ConnectionProblem(fmt.Errorf("no servers remaining to connect"), "")
+}
+
+// DialWebsocket dials a websocket connection over the transport's reverse
+// tunnel.
+func (t *transport) DialWebsocket(network, address string) (net.Conn, error) {
+	conn, err := t.DialContext(context.Background(), network, address)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// App access connections over reverse tunnel use mutual TLS.
+	return tls.Client(conn, t.clientTLSConfig), nil
+}
+
+// dialAppServer dial and connect to the application service over the reverse
+// tunnel subsystem.
+func dialAppServer(proxyClient reversetunnel.Tunnel, identity *tlsca.Identity, server types.AppServer) (net.Conn, error) {
+	clusterClient, err := proxyClient.GetSite(identity.RouteToApp.ClusterName)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	conn, err := clusterClient.Dial(reversetunnel.DialParams{
+		From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@web-proxy"},
+		To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
+		ServerID: fmt.Sprintf("%v.%v", server.GetHostID(), identity.RouteToApp.ClusterName),
+		ConnType: types.AppTunnel,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return conn, nil
 }
 
 // configureTLS creates and configures a *tls.Config that will be used for
