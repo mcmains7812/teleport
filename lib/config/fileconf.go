@@ -1122,7 +1122,7 @@ type Proxy struct {
 	// client connections.
 	PostgresPublicAddr apiutils.Strings `yaml:"postgres_public_addr,omitempty"`
 
-	// MongoAddr is Postgres proxy listen address.
+	// MongoAddr is Mongo proxy listen address.
 	MongoAddr string `yaml:"mongo_listen_addr,omitempty"`
 	// MongoPublicAddr is the hostport the proxy advertises for Mongo
 	// client connections.

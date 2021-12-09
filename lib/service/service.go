@@ -3202,7 +3202,7 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
 		if listeners.db.mongo != nil {
 			process.RegisterCriticalFunc("proxy.db.mongo", func() error {
 				log.Infof("Starting Database Mongo proxy server on %v.", cfg.Proxy.MongoAddr.Addr)
-				if err := dbProxyServer.ServerMongo(listeners.db.mongo, tlsConfigWeb.Clone()); err != nil {
+				if err := dbProxyServer.ServeMongo(listeners.db.mongo, tlsConfigWeb.Clone()); err != nil {
 					log.WithError(err).Warn("Database Mongo proxy server exited with error.")
 				}
 				return nil

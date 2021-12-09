@@ -202,8 +202,8 @@ func (s *ProxyServer) ServeMySQL(listener net.Listener) error {
 	}
 }
 
-// ServerMongo starts accepting Mongo client connections.
-func (s *ProxyServer) ServerMongo(listener net.Listener, tlsConfig *tls.Config) error {
+// ServeMongo starts accepting Mongo client connections.
+func (s *ProxyServer) ServeMongo(listener net.Listener, tlsConfig *tls.Config) error {
 	s.log.Debug("Started Mongo proxy.")
 	defer s.log.Debug("Mongo proxy exited.")
 	for {
